@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shrimp Rain — Anoma x Shrimpers (Pixel Catch)</title>
+<style>
+  :root{
+    --bg:#0b1020;        /* deep space blue */
+    --fg:#e9f1ff;        /* soft white */
+    --accent:#00ffd0;    /* neon teal (anoma vibe) */
+    --shrimp:#ff6a6a;    /* shrimp red */
+    --gold:#ffd54a;      /* bonus intent shrimp */
+    --bad:#6aa84f;       /* algae (avoid) */
+    --ui:#121830;        /* hud background */
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;}
+  .wrap{max-width:960px;margin:0 auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+  header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  h1{font-size:16px;margin:0;letter-spacing:.5px;color:var(--accent)}
+  .hud{display:flex;gap:10px;flex-wrap:wrap;background:var(--ui);border:1px solid #1b2346;padding:8px;border-radius:8px}
+  .hud span{padding:4px 8px;background:#0f1633;border-radius:6px;border:1px solid #1b2346}
+  .btnrow{display:flex;gap:8px;flex-wrap:wrap}
+  button{background:#1a2144;color:var(--fg);border:1px solid #2a3470;padding:8px 10px;border-radius:8px;cursor:pointer}
+  button:hover{background:#212a57}
+  canvas{image-rendering: pixelated; image-rendering: crisp-edges; background:linear-gradient(#0b1020 0%, #0b1020 60%, #09122a 100%); border:1px solid #1b2346; border-radius:10px; width:100%; height:auto;}
+  .touch{display:flex;gap:10px;justify-content:center}
+  .touch button{min-width:80px}
+  footer{opacity:.7;font-size:12px}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>🦐 Shrimp Rain — <span style="color:#b4fffb">@anoma</span> x <span style="color:#ffd7d7">Shrimpers</span></h1>
+      <div class="btnrow">
+        <button id="btnPause" title="P">⏸ Pause</button>
+        <button id="btnMute" title="M">🔇 Mute</button>
+        <button id="btnRestart" title="R">🔁 Restart</button>
+      </div>
+    </header>
+
+    <div class="hud" role="status" aria-live="polite">
+      <span>Score: <b id="score">0</b></span>
+      <span>Combo: <b id="combo">x1</b></span>
+      <span>Lives: <b id="lives">3</b></span>
+      <span>Time: <b id="time">60</b>s</span>
+      <span>High: <b id="high">0</b></span>
+      <span style="flex:1;text-align:right">Controls: ←/→ or A/D • P:Pause • M:Mute • R:Restart</span>
+    </div>
+
+    <canvas id="game" width="320" height="180" aria-label="Shrimp Rain pixel game" role="img"></canvas>
+
+    <div class="touch" aria-hidden="false">
+      <button id="left">⬅️ Left</button>
+      <button id="catch">👜 Catch</button>
+      <button id="right">➡️ Right</button>
+    </div>
+
+    <footer>
+      tip: golden “intent” shrimps = bonus • green algae = bad • keep the combo alive!<br/>
+      credits: made for the anoma / shrimpers community — “proofs replace promises” 🌀
+    </footer>
+  </div>
+
+<script>
+(() => {
+  // ====== CONFIG ======
+  const BASE_W = 320;   // internal pixel resolution (keeps crisp look)
+  const BASE_H = 180;
+  const GROUND_Y = BASE_H - 18;
+
+  const STATE = { READY:0, PLAY:1, PAUSE:2, GAMEOVER:3 };
+
+  const cfg = {
+    gravity:   22,          // px/s^2
+    playerSpeed: 80,        // px/s
+    spawnEvery: 0.75,       // seconds initial
+    spawnMin:   0.25,       // floor as difficulty ramps
+    rampEvery:  10,         // every X seconds, increase difficulty
+    rampFactor: 0.92,       // multiply spawnEvery by this
+    gameTime:   60,         // seconds
+    maxLives:   3
+  };
+
+  // ====== DOM ======
+  const cvs = document.getElementById('game');
+  const ctx = cvs.getContext('2d');
+  const ui = {
+    score: document.getElementById('score'),
+    combo: document.getElementById('combo'),
+    lives: document.getElementById('lives'),
+    time:  document.getElementById('time'),
+    high:  document.getElementById('high'),
+    pause: document.getElementById('btnPause'),
+    mute:  document.getElementById('btnMute'),
+    restart: document.getElementById('btnRestart'),
+    left:  document.getElementById('left'),
+    right: document.getElementById('right'),
+    catch: document.getElementById('catch'),
+  };
+
+  // ====== AUDIO (simple bleep with WebAudio, respects mute) ======
+  const AudioSys = (() => {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const actx = AC ? new AC() : null;
+    let muted = false;
+
+    function beep(freq=440, dur=0.08, type='square', gain=0.03){
+      if(!actx || muted) return;
+      const o = actx.createOscillator();
+      const g = actx.createGain();
+      o.type = type;
+      o.frequency.value = freq;
+      g.gain.value = gain;
+      o.connect(g); g.connect(actx.destination);
+      o.start();
+      o.stop(actx.currentTime + dur);
+    }
+    function click(){ beep(660, 0.05, 'square', 0.02); }
+    function good(){ beep(880, 0.07, 'triangle', 0.04); }
+    function bad(){  beep(180, 0.12, 'sawtooth', 0.05); }
+    function setMute(m){ muted = m; }
+    function isMuted(){ return muted; }
+    return {beep, click, good, bad, setMute, isMuted, actx};
+  })();
+
+  // ====== UTIL ======
+  const rand = (a,b)=>a+Math.random()*(b-a);
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+
+  // ====== GAME OBJECTS ======
+  const game = {
+    state: STATE.READY,
+    t: 0,
+    lastSpawn: 0,
+    spawnEvery: cfg.spawnEvery,
+    leftHeld:false, rightHeld:false, catchHeld:false,
+    score:0, combo:1, lives:cfg.maxLives, timeLeft:cfg.gameTime,
+    high: parseInt(localStorage.getItem('shrimp_high')||'0',10),
+    objects: [],
+    player: { x: BASE_W/2-6, y: GROUND_Y-12, w: 14, h: 14, facing:1, bagLift:0 },
+  };
+
+  ui.high.textContent = game.high;
+
+  // Object types
+  const TYPE = { SHRIMP:0, GOLD:1, ALGAE:2 };
+
+  function spawn(){
+    const r = Math.random();
+    let type = TYPE.SHRIMP;
+    if (r>0.88) type = TYPE.GOLD;      // ~12% golden
+    else if (r<0.08) type = TYPE.ALGAE; // ~8% bad
+    const x = rand(6, BASE_W-6);
+    const v = rand(22, 55);
+    game.objects.push({
+      type,
+      x, y: rand(-20,-6),
+      vx: rand(-10,10),
+      vy: v,
+      w: 8, h: 8,
+      rot: rand(0,Math.PI*2),
+      caught:false,
+      grounded:false
+    });
+  }
+
+  // ====== INPUT ======
+  const keys = {};
+  window.addEventListener('keydown', (e)=>{
+    keys[e.key.toLowerCase()] = true;
+    if(e.key==='ArrowLeft') keys['a']=true;
+    if(e.key==='ArrowRight') keys['d']=true;
+
+    if(e.key.toLowerCase()==='p'){ togglePause(); }
+    if(e.key.toLowerCase()==='m'){ toggleMute(); }
+    if(e.key.toLowerCase()==='r'){ restart(); }
+    if(game.state===STATE.READY && (e.key===' ' || e.key==='Enter')) start();
+  });
+  window.addEventListener('keyup', (e)=>{
+    keys[e.key.toLowerCase()] = false;
+    if(e.key==='ArrowLeft') keys['a']=false;
+    if(e.key==='ArrowRight') keys['d']=false;
+  });
+
+  // touch controls
+  let leftDown=false, rightDown=false, catchDown=false;
+  function bindHold(el, setter){
+    const on = (e)=>{ e.preventDefault(); setter(true); };
+    const off= (e)=>{ e.preventDefault(); setter(false); };
+    el.addEventListener('pointerdown', on);
+    el.addEventListener('pointerup', off);
+    el.addEventListener('pointerleave', off);
+    el.addEventListener('pointercancel', off);
+  }
+  bindHold(ui.left,  v=>leftDown=v);
+  bindHold(ui.right, v=>rightDown=v);
+  bindHold(ui.catch, v=>catchDown=v);
+
+  ui.pause.addEventListener('click', ()=>togglePause());
+  ui.mute.addEventListener('click', ()=>toggleMute());
+  ui.restart.addEventListener('click', ()=>restart());
+
+  function start(){
+    if(game.state!==STATE.READY && game.state!==STATE.GAMEOVER) return;
+    if (AudioSys.actx && AudioSys.actx.state === 'suspended') AudioSys.actx.resume();
+    game.state=STATE.PLAY;
+    AudioSys.click();
+  }
+  function togglePause(){
+    if(game.state===STATE.PLAY){ game.state=STATE.PAUSE; }
+    else if(game.state===STATE.PAUSE){ game.state=STATE.PLAY; }
+    AudioSys.click();
+  }
+  function toggleMute(){
+    const m = !AudioSys.isMuted();
+    AudioSys.setMute(m);
+    ui.mute.textContent = m ? '🔊 Unmute' : '🔇 Mute';
+    if(!m) AudioSys.click();
+  }
+  function restart(){
+    game.state=STATE.READY;
+    game.t=0; game.lastSpawn=0; game.spawnEvery=cfg.spawnEvery;
+    game.score=0; game.combo=1; game.lives=cfg.maxLives; game.timeLeft=cfg.gameTime;
+    game.objects.length=0;
+    game.player.x = BASE_W/2-6; game.player.facing=1; game.player.bagLift=0;
+    updateHUD();
+    AudioSys.click();
+  }
+
+  // ====== UPDATE ======
+  let lastTS = 0;
+  function loop(ts){
+    requestAnimationFrame(loop);
+    if(!lastTS) lastTS=ts;
+    const dt = Math.min((ts-lastTS)/1000, 0.033); // clamp large frames
+    lastTS = ts;
+
+    // gamepad-like mapping
+    game.leftHeld = !!keys['a'] || leftDown;
+    game.rightHeld = !!keys['d'] || rightDown;
+    game.catchHeld = catchDown || !!keys[' '];
+
+    if(game.state===STATE.PLAY){
+      game.t += dt;
+      game.timeLeft = Math.max(0, game.timeLeft - dt);
+      if(game.timeLeft<=0){ endGame(); }
+      // ramp difficulty
+      if (Math.floor((cfg.gameTime-game.timeLeft)) % cfg.rampEvery===0) {
+        // gentle: only adjust when crossing new block
+      }
+      // spawn logic
+      game.lastSpawn += dt;
+      if (game.lastSpawn >= game.spawnEvery){
+        game.lastSpawn=0;
+        spawn();
+        // slowly ramp spawn rate
+        game.spawnEvery = Math.max(cfg.spawnMin, game.spawnEvery* (1 - 0.002));
+      }
+      updatePlayer(dt);
+      updateObjects(dt);
+      updateHUD();
+    }
+
+    render();
+  }
+  requestAnimationFrame(loop);
+
+  function endGame(){
+    game.state=STATE.GAMEOVER;
+    if(game.score>game.high){
+      game.high=game.score;
+      localStorage.setItem('shrimp_high', String(game.high));
+      ui.high.textContent = game.high;
+    }
+  }
+
+  function updateHUD(){
+    ui.score.textContent = game.score;
+    ui.combo.textContent = 'x'+game.combo;
+    ui.lives.textContent = game.lives;
+    ui.time.textContent  = Math.ceil(game.timeLeft);
+  }
+
+  function updatePlayer(dt){
+    const p = game.player;
+    let dir = 0;
+    if (game.leftHeld) dir -= 1;
+    if (game.rightHeld) dir += 1;
+    p.x += dir * cfg.playerSpeed * dt;
+    p.x = clamp(p.x, 2, BASE_W - p.w - 2);
+    if (dir !== 0) p.facing = dir;
+    // bag lift animation when catchHeld
+    const targetLift = game.catchHeld ? 6 : 0;
+    p.bagLift += (targetLift - p.bagLift) * Math.min(1, 10*dt);
+  }
+
+  function updateObjects(dt){
+    const p = game.player;
+    for (let o of game.objects){
+      if(o.caught || o.grounded) continue;
+      // physics
+      o.vy += cfg.gravity * dt;
+      o.y += o.vy * dt;
+      o.x += o.vx * dt;
+      o.rot += (o.type===TYPE.GOLD ? 4 : 2) * dt * (o.vx>=0?1:-1);
+
+      // wrap sides a bit for fun
+      if (o.x < -6) o.x = BASE_W+6;
+      if (o.x > BASE_W+6) o.x = -6;
+
+      // ground
+      if (o.y + o.h >= GROUND_Y){
+        o.y = GROUND_Y - o.h;
+        o.grounded = true;
+        // missed good shrimp → lose combo
+        if (o.type!==TYPE.ALGAE){
+          game.combo = 1;
+        }
+      }
+
+      // catch check (simple AABB, bag has extra reach when lifted)
+      const bagW = 10, bagH = 10;
+      const bagX = p.x + (p.facing>0 ? p.w-2 : -bagW+2);
+      const bagY = p.y - p.bagLift;
+
+      if (rectOverlap(bagX,bagY,bagW,bagH, o.x,o.y,o.w,o.h) && !o.caught && !o.grounded){
+        o.caught = true;
+        if (o.type===TYPE.ALGAE){
+          // bad catch
+          game.lives -= 1;
+          game.combo = 1;
+          AudioSys.bad();
+          if(game.lives<=0) endGame();
+        } else {
+          // good catch
+          const base = (o.type===TYPE.GOLD? 150 : 50);
+          const add  = base * game.combo;
+          game.score += add;
+          game.combo = Math.min(10, game.combo+1);
+          AudioSys.good();
+        }
+      }
+    }
+    // cleanup
+    game.objects = game.objects.filter(o => !(o.caught) && o.y < BASE_H + 40);
+  }
+
+  function rectOverlap(ax,ay,aw,ah, bx,by,bw,bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  // ====== RENDER (pixel art) ======
+  function render(){
+    ctx.imageSmoothingEnabled = false;
+
+    // sky gradient already on canvas background; draw horizon
+    ctx.clearRect(0,0,BASE_W,BASE_H);
+    drawSky();
+    drawStars();
+    drawTitleBadge();
+
+    // ground
+    drawGround();
+
+    // objects
+    for (let o of game.objects){
+      drawObject(o);
+    }
+
+    // player
+    drawPlayer(game.player);
+
+    // overlays
+    if (game.state===STATE.READY) drawCenterText("Press SPACE/ENTER to start", "#b4fffb");
+    if (game.state===STATE.PAUSE) drawCenterText("Paused — press P to resume", "#ffd54a");
+    if (game.state===STATE.GAMEOVER) drawCenterText("Game Over — press R to restart", "#ff9aa2");
+  }
+
+  function drawSky(){
+    // subtle vertical bands for depth
+    for (let y=0; y<BASE_H; y+=2){
+      const t = y/BASE_H;
+      ctx.fillStyle = `rgb(${10+10*t|0}, ${16+10*t|0}, ${40+30*t|0})`;
+      ctx.fillRect(0,y,BASE_W,2);
+    }
+  }
+  function drawStars(){
+    // anoma-ish teal dots
+    for (let i=0;i<40;i++){
+      const x = (i*53 + (game.t*20|0)) % BASE_W;
+      const y = (i*17) % (GROUND_Y-20);
+      ctx.fillStyle = i%7===0 ? "#00ffd0" : "#94fff0";
+      ctx.fillRect(x, y, 1, 1);
+    }
+  }
+  function drawTitleBadge(){
+    ctx.fillStyle = "#0f1633cc";
+    ctx.fillRect(6,6,140,22);
+    pxText(10, 12, "SHRIMP RAIN", "#ffd7d7");
+    pxText(10, 20, "@anoma x shrimpers", "#b4fffb");
+  }
+  function drawGround(){
+    // dark band
+    ctx.fillStyle = "#081024";
+    ctx.fillRect(0, GROUND_Y, BASE_W, BASE_H - GROUND_Y);
+    // simple scanline
+    for (let x=0;x<BASE_W;x+=4){
+      ctx.fillStyle = "#0a1733";
+      ctx.fillRect(x, GROUND_Y-1, 2, 1);
+    }
+  }
+
+  function drawPlayer(p){
+    // robe (red blocky)
+    ctx.fillStyle = "#b30d2f";
+    ctx.fillRect(p.x, p.y, p.w, p.h);
+
+    // face hood glow (green eyes)
+    ctx.fillStyle = "#1a0010";
+    ctx.fillRect(p.x+3, p.y+2, 8, 5);
+    ctx.fillStyle = "#00ffbf";
+    ctx.fillRect(p.x+4, p.y+3, 2, 2);
+    ctx.fillRect(p.x+8, p.y+3, 2, 2);
+
+    // bag
+    const bagW = 8, bagH = 8;
+    const bx = p.x + (p.facing>0 ? p.w-2 : -bagW+2);
+    const by = p.y - p.bagLift + 2;
+    ctx.fillStyle = "#d9f9ff";
+    ctx.fillRect(bx, by, bagW, bagH);
+    ctx.fillStyle = "#9adbe7";
+    ctx.fillRect(bx+1, by+1, bagW-2, bagH-2);
+
+    // tiny arm to bag
+    ctx.fillStyle = "#7a0016";
+    if (p.facing>0) ctx.fillRect(p.x+p.w-2, p.y+6, 3, 2);
+    else            ctx.fillRect(p.x-1,       p.y+6, 3, 2);
+  }
+
+  function drawObject(o){
+    ctx.save();
+    ctx.translate(o.x + o.w/2, o.y + o.h/2);
+    ctx.rotate(o.rot);
+    ctx.translate(-o.w/2, -o.h/2);
+
+    if (o.type===TYPE.SHRIMP){
+      drawShrimp("#ff6a6a", "#ffb3b3");
+    } else if (o.type===TYPE.GOLD){
+      drawShrimp("#ffd54a", "#fff1a8");
+      // aura
+      ctx.fillStyle = "rgba(255,213,74,0.25)";
+      ctx.fillRect(-2,-2, o.w+4, o.h+4);
+    } else {
+      // algae bad
+      ctx.fillStyle = "#6aa84f";
+      ctx.fillRect(0,0,o.w,o.h);
+      ctx.fillStyle = "#8cc57a";
+      ctx.fillRect(1,1,o.w-2,o.h-2);
+    }
+    ctx.restore();
+
+    function drawShrimp(body="#ff6a6a", belly="#ffc0c0"){
+      // very simple pixel shrimp (8x8 feel)
+      ctx.fillStyle = body;
+      ctx.fillRect(0,2,6,4);     // body
+      ctx.fillRect(5,1,2,6);     // tail
+      ctx.fillStyle = belly;
+      ctx.fillRect(1,3,3,2);     // belly highlight
+      ctx.fillStyle = "#2b0b0b"; // eye
+      ctx.fillRect(1,2,1,1);
+      // little antenna
+      ctx.fillStyle = body;
+      ctx.fillRect(0,1,1,1);
+      ctx.fillRect(0,6,1,1);
+    }
+  }
+
+  function drawCenterText(text, color="#fff"){
+    const w = 220, h = 26;
+    ctx.fillStyle = "rgba(9, 18, 42, 0.9)";
+    ctx.fillRect((BASE_W-w)/2, (BASE_H-h)/2, w, h);
+    pxText((BASE_W-w)/2+8, (BASE_H-h)/2+8, text, color);
+  }
+
+  // tiny pixel font (7px line)
+  function pxText(x,y,str,color="#fff"){
+    ctx.fillStyle = color;
+    ctx.font = "7px monospace";
+    ctx.textBaseline = "top";
+    ctx.fillText(str, x, y);
+  }
+
+  // start in READY state
+  restart();
+
+  // kick off with space/enter click on canvas
+  cvs.addEventListener('click', ()=> start());
+})();
+</script>
+</body>
+</html>
